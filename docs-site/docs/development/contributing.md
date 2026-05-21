@@ -78,7 +78,7 @@ npm run pack
 For consistent builds across environments:
 
 ```bash
-podman run -it --rm --volume .:/var/mnt:z -w /var/mnt/ node:20 /bin/bash -c \
+podman run -it --rm --volume .:/var/mnt:z -w /var/mnt/ node:22 /bin/bash -c \
   "apt update && apt install -y rpm && npm ci && npm run dist:linux"
 ```
 
