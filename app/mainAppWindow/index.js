@@ -350,10 +350,20 @@ const AUTH_FAILURE_PATTERNS = ['InteractionRequired'];
 // logging InteractionRequired (#2480). But the worker emits the same "UPR:" shape
 // for routine transient failures (pinned channels, presence, "Invalid id
 // undefined", and an empty reason) in perfectly healthy sessions, so matching
-// every UPR caused ~hourly false-positive clear-and-reloads for all users. Only
-// treat UPRs as auth failures when the user has opted into aggressive reauth
-// recovery (auth.reauthRecovery.enabled).
+// every UPR caused ~hourly false-positive clear-and-reloads. Treat UPRs as auth
+// failures only when the user has opted into aggressive reauth recovery
+// (auth.reauthRecovery.enabled), and even then filter and confirm them (see the
+// transient denylist and the persistence check below) so a single transient UPR
+// never forces a reload.
 const OPT_IN_AUTH_FAILURE_PATTERNS = ['Uncaught Error: UPR:'];
+// UPRs whose reason matches one of these is a known transient, non-auth worker
+// failure that occurs on perfectly healthy sessions (pinned-channel
+// RemoteOperationFailed, the presence endpoint, "Invalid id undefined"). These
+// are never a stale-session signal, so they are dropped outright — not even
+// recorded for popup correlation. Matched case-insensitively against the UPR
+// text. Empty-reason UPRs (the originally-observed genuine signal, #2480) are
+// deliberately not listed here; they instead rely on the persistence check.
+const TRANSIENT_UPR_PATTERNS = ['remoteoperationfailed', 'invalid id', 'presence'];
 // Only trust auth failure signals from Teams/Microsoft origins
 const TRUSTED_AUTH_SOURCES = ['teams.cloud.microsoft', 'teams.microsoft.com', 'login.microsoftonline.com'];
 // Loop guard for the automatic clear-and-reload. A cooldown rather than a
@@ -364,6 +374,20 @@ const TRUSTED_AUTH_SOURCES = ['teams.cloud.microsoft', 'teams.microsoft.com', 'l
 // reload loops if a recovery fails to fix the session.
 let lastAuthRecoveryAt = 0;
 const AUTH_RECOVERY_COOLDOWN_MS = 30 * 60 * 1000;
+// Persistence guard for the automatic (non-call) UPR path. A single worker UPR
+// is routine noise even with reauthRecovery on, so the clear-and-reload must
+// only fire once UPRs *persist* — the same confirmation the mid-call path
+// already requires (MIDCALL_WORKER_SIGNAL_CONFIRM_MS). A genuinely stale
+// session emits UPRs every few minutes; healthy-session UPRs are sparse
+// (≥~30 min apart, which is why the 30-min cooldown alone still let them
+// through hourly). So track when the current run of UPR signals began: require
+// it to span UPR_CONFIRM_MS before acting, and reset the run after a quiet gap
+// (UPR_SIGNAL_RESET_MS) so an isolated UPR an hour later never counts as
+// sustained. The reliable InteractionRequired signal bypasses this entirely.
+let firstUprSignalAt = 0;
+let lastUprSignalAt = 0;
+const UPR_CONFIRM_MS = 3 * 60 * 1000;
+const UPR_SIGNAL_RESET_MS = 10 * 60 * 1000;
 // Worker UPRs are transient during active calls (#2428); suppress them only while
 // a call is in progress so startup recovery still works for stale-token loops (#2480).
 let callActive = false;
@@ -398,6 +422,27 @@ function recordAuthFailureSignal() {
   }
 }
 
+// True for UPR text whose reason is a known transient, non-auth worker failure
+// (see TRANSIENT_UPR_PATTERNS). Such UPRs are dropped before they can record a
+// signal or trigger recovery.
+function isTransientUpr(text) {
+  const lower = text.toLowerCase();
+  return TRANSIENT_UPR_PATTERNS.some(p => lower.includes(p));
+}
+
+// Advances the UPR persistence run and returns true once UPR signals have been
+// sustained for at least UPR_CONFIRM_MS. A gap longer than UPR_SIGNAL_RESET_MS
+// since the previous UPR starts a fresh run, so a lone UPR — the routine case
+// on a healthy session — never confirms.
+function uprSignalConfirmed() {
+  const now = Date.now();
+  if (!firstUprSignalAt || now - lastUprSignalAt > UPR_SIGNAL_RESET_MS) {
+    firstUprSignalAt = now;
+  }
+  lastUprSignalAt = now;
+  return now - firstUprSignalAt >= UPR_CONFIRM_MS;
+}
+
 /**
  * Checks a renderer-originated message (console output or forwarded window
  * error) for auth-failure signatures and schedules recovery on a match.
@@ -406,15 +451,22 @@ function recordAuthFailureSignal() {
  */
 function maybeScheduleAuthRecovery(message, sourceId) {
   const text = message || '';
-  const matched =
-    AUTH_FAILURE_PATTERNS.some(p => text.includes(p)) ||
-    (config?.auth?.reauthRecovery?.enabled &&
-      OPT_IN_AUTH_FAILURE_PATTERNS.some(p => text.includes(p)));
-  if (!matched) return;
+  // InteractionRequired is the reliable signal; UPRs are the noisy opt-in one.
+  const reliable = AUTH_FAILURE_PATTERNS.some(p => text.includes(p));
+  const upr =
+    !reliable &&
+    config?.auth?.reauthRecovery?.enabled &&
+    OPT_IN_AUTH_FAILURE_PATTERNS.some(p => text.includes(p));
+  if (!reliable && !upr) return;
 
   // Verify the message originates from a trusted Microsoft source
   const source = sourceId || '';
   if (source && !TRUSTED_AUTH_SOURCES.some(s => source.includes(s))) return;
+
+  // A UPR with a known-transient reason is healthy-session noise, never a stale
+  // session — drop it entirely so it can't keep the popup-correlation window
+  // open or accumulate toward the persistence threshold.
+  if (upr && isTransientUpr(text)) return;
 
   // Record the signal even while recovery is cooling down or a call is
   // active, so the login-popup interception can still correlate against a
@@ -427,6 +479,11 @@ function maybeScheduleAuthRecovery(message, sourceId) {
     handleMidCallAuthSignal(source);
     return;
   }
+
+  // Non-call automatic path: a single worker UPR is routine noise even with
+  // reauthRecovery on (#2428), so only clear-and-reload once UPRs have
+  // persisted. InteractionRequired still recovers immediately.
+  if (upr && !uprSignalConfirmed()) return;
 
   scheduleAuthRecovery();
 }
